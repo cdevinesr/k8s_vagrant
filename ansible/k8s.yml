@@ -1,0 +1,229 @@
+---
+# Kubernetes Cluster Provisioner
+# Author: Claude Devine
+
+- name: Install Kubernetes and configure system for cluster operations
+  hosts: all
+  become: true
+  tasks:
+    - name: Configure /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ item.ip }}\t{{ item.hostname }}"
+        state: present
+      with_items:
+      - { ip: "172.16.94.10", hostname: "c1-master1" }
+      - { ip: "172.16.94.11", hostname: "c1-node1" }
+      - { ip: "172.16.94.12", hostname: "c1-node2" }
+      - { ip: "172.16.94.13", hostname: "c1-node3" }
+
+    - name: Add Docker GPG key to APT
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker APT repository
+      apt_repository:
+        repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu bionic stable
+        state: present
+
+    - name: Add Google's GPG key to APT
+      apt_key:
+        url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+        state: present
+
+    - name: Add Kubernetes APT repository
+      apt_repository:
+        repo: deb https://apt.kubernetes.io kubernetes-xenial main
+        filename: kubernetes
+        state: present
+
+    - name: Install Docker
+      apt:
+        name: "{{ packages }}"
+        state: present
+      vars:
+        packages:
+        - docker-ce
+        - docker-ce-cli
+        - containerd.io
+      register: docker_installed
+
+    - block:
+      - name: Mark docker packages as held
+        dpkg_selections:
+          name: "{{ item }}"
+          selection: hold
+        with_items:
+        - docker-ce
+        - docker-ce-cli
+        - containerd.io
+
+      - name: Enable docker service to start on boot
+        systemd:
+          name: docker.service
+          enabled: yes
+
+      - name: Ensure Docker service is started
+        systemd:
+          name: docker.service
+          state: started
+
+      when: docker_installed is success
+
+    - name: Install Kubernetes
+      apt:
+        name: "{{ packages }}"
+        state: present
+      vars:
+        packages:
+        - kubelet
+        - kubeadm
+        - kubectl
+      when: docker_installed is success
+      register: kubernetes_installed
+
+    - block:
+      - name: Mark Kubernetes packages as held
+        dpkg_selections:
+          name: "{{ item }}"
+          selection: hold
+        with_items:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+      - name: Enable kubelet service to start on boot
+        systemd:
+          name: kubelet.service
+          enabled: yes
+
+      - name: Configure kubelet node IP
+        lineinfile:
+          path: /etc/default/kubelet
+          line: KUBELET_EXTRA_ARGS=--node-ip={{ node_ip }}
+          create: yes
+        register: kubelet_node_ip
+
+      - name: Restart kubelet if node IP changed
+        systemd:
+          name: kubelet.service
+          daemon-reload: yes
+          state: restarted
+        when: kubelet_node_ip is changed
+
+      - name: Disable swap (running)
+        command: swapoff -a
+        when: ansible_swaptotal_mb > 0
+
+      - name: Disable swap (fstab)
+        mount:
+          name: "{{ item }}"
+          fstype: swap
+          state: absent
+        with_items:
+        - swap
+        - none
+
+      when: kubernetes_installed is success
+
+    - name: Check whether Kubernetes cluster is configured
+      stat:
+        path: /etc/kubernetes/admin.conf
+      when: k8s_master == true
+      register: kubernetes_cluster_configured
+
+    # Master only
+    - block:
+      - name: Set up SSH keys (optional)
+        copy:
+          src: "{{ item }}"
+          dest: "/home/vagrant/.ssh/{{ item | basename }}"
+          mode: 0600
+          owner: vagrant
+          group: vagrant
+        with_fileglob:
+        - "id_rsa*"
+
+      - name: Initialize Kubernetes cluster
+        command: kubeadm init --apiserver-advertise-address="{{ node_ip }}" --apiserver-cert-extra-sans="{{ node_ip }}" --pod-network-cidr="192.168.0.0/16"
+        register: kubernetes_cluster_created
+
+      - block:
+        - name: Create Kubernetes configuration directory for vagrant user
+          file:
+            path: /home/vagrant/.kube
+            owner: vagrant
+            group: vagrant
+            mode: 0700
+            state: directory
+
+        - name: Configure vagrant user to have admin access on newly-created cluster
+          command: cp /etc/kubernetes/admin.conf /home/vagrant/.kube/config
+          register: copy_k8s_config
+
+        - name: Set ownership and permissions for vagrant user's Kubernetes configuration file
+          file:
+            path: /home/vagrant/.kube/config
+            owner: vagrant
+            group: vagrant
+            mode: 0600
+          when: copy_k8s_config is success
+
+        - name: Load Calico v3.11 for pod networking
+          become: false
+          command: kubectl create -f https://docs.projectcalico.org/v3.11/manifests/calico.yaml
+
+        - name: Remove old join command file (if it exists)
+          local_action: file path=./join_command state=absent
+
+        - name: Generate join command for nodes
+          command: kubeadm token create --print-join-command --v=5
+          register: join_command
+
+        - name: Export join command for nodes
+          local_action: copy content="{{ join_command.stdout_lines[0] }}" dest="./join_command"
+          when: join_command is success
+
+        when: kubernetes_cluster_created is success
+
+      when: k8s_master == true and kubernetes_cluster_configured.stat.exists == false
+
+    - name: Enable bash completion for kubectl
+      shell: kubectl completion bash > kubectl
+      args:
+        chdir: /etc/bash_completion.d/
+        creates: kubectl
+      when: k8s_master == true
+
+    # Nodes only
+    - block:
+      - name: Set up SSH keys
+        lineinfile:
+          path: /home/vagrant/.ssh/authorized_keys
+          line: "{{ lookup('file', 'id_rsa.pub') }}"
+          create: yes
+          state: present
+
+      - name: Check whether join command was provided by master
+        local_action: stat path="./join_command"
+        register: node_join_command
+
+      - block:
+        - name: Copy join command file to node
+          copy:
+            src: ./join_command
+            dest: /tmp/join.sh
+            mode: 0700
+
+        - name: Join node to cluster
+          command: sh /tmp/join.sh
+
+        - name: Remove join command script
+          file:
+            path: /tmp/join.sh
+            state: absent
+
+        when: node_join_command.stat.exists == true
+
+      when: k8s_master == false

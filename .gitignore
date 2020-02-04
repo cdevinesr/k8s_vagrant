@@ -1,0 +1,9 @@
+# Ignore Vim swap files
+.*.sw*
+
+# Ignore generated join command file
+ansible/join_command
+
+# Ignore locally-used SSH keypair
+ansible/id_rsa
+ansible/id_rsa.pub
